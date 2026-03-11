@@ -19,7 +19,9 @@ class Message:
         self.jsonheader = None
         self.response = None
         self.buffersize = int(2**14)
-        self.stop = stop        
+        self.stop = stop
+        self.peer_closed = False
+        self.error = None
 
     def _set_selector_events_mask(self, mode):
         """Set selector to listen for events: mode is 'r', 'w', or 'rw'."""
@@ -39,25 +41,29 @@ class Message:
             data = self.sock.recv(self.buffersize)
         except BlockingIOError:
             # Resource temporarily unavailable (errno EWOULDBLOCK)
-            pass
+            return
+        except (ConnectionResetError, OSError) as exc:
+            self.error = exc
+            self.peer_closed = True
+            raise RuntimeError(f"Socket read failed for {self.addr}: {exc}") from exc
+        if data:
+            self._recv_buffer += data
         else:
-            if data:
-                self._recv_buffer += data
-            else:
-                # raise RuntimeError("Peer closed.")
-                pass
+            self.peer_closed = True
+            raise RuntimeError(f"Peer closed connection: {self.addr}")
 
     def _write(self):
         if self._send_buffer:
-            #print(f"Sending {self._send_buffer!r} to {self.addr}")
             try:
                 # Should be ready to write
                 sent = self.sock.send(self._send_buffer)
             except BlockingIOError:
-                # Resource temporarily unavailable (errno EWOULDBLOCK)
-                pass
-            else:
-                self._send_buffer = self._send_buffer[sent:]
+                return
+            except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+                self.error = exc
+                self.peer_closed = True
+                raise RuntimeError(f"Socket write failed for {self.addr}: {exc}") from exc
+            self._send_buffer = self._send_buffer[sent:]
 
     def _json_encode(self, obj, encoding):
         return json.dumps(obj, ensure_ascii=False).encode(encoding)
@@ -199,9 +205,9 @@ class Message:
         if self.jsonheader["content-type"] == "text/json":
             encoding = self.jsonheader["content-encoding"]
             self.response = self._json_decode(data, encoding)
-            if len(self.response['result']) <= 1024:
-                len(self.response['result'])
-                #print(f"Received response {self.response!r} from {self.addr}")
+            result = self.response.get("result") if isinstance(self.response, dict) else self.response
+            if isinstance(result, (str, bytes)) and len(result) <= 1024:
+                pass
             self._process_response_json_content()
         else:
             # Binary or unknown content-type

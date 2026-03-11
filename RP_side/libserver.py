@@ -70,14 +70,14 @@ class Message:
             # Should be ready to read
             data = self.sock.recv(4096)
         except BlockingIOError:
-            print('Resource unavailable')
             # Resource temporarily unavailable (errno EWOULDBLOCK)
-            pass
+            return
+        except (ConnectionResetError, OSError) as exc:
+            raise RuntimeError(f"Socket read failed for {self.addr}: {exc}") from exc
+        if data:
+            self._recv_buffer += data
         else:
-            if data:
-                self._recv_buffer += data
-            else:
-                raise RuntimeError("Peer closed.")
+            raise RuntimeError("Peer closed.")
     
     def read(self): 
         self._read()    #receive incoming message and store it in buffer
