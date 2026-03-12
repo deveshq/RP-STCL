@@ -8,6 +8,7 @@ import inspect
 import os
 import subprocess
 import sys
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -27,9 +28,49 @@ KNOWN_REDPITAYA_PYTHON_PATHS = (
     Path("/opt/redpitaya/lib/python/site-packages"),
 )
 
+KNOWN_REDPITAYA_PYTHON_PATHS = (
+    Path("/opt/redpitaya/lib/python"),
+    Path("/opt/redpitaya/lib/python3"),
+    Path("/opt/redpitaya/lib/python3.10"),
+    Path("/opt/redpitaya/lib/python3.11"),
+    Path("/opt/redpitaya/lib/python3.12"),
+    Path("/opt/redpitaya/lib/python/site-packages"),
+)
+
 
 class OverlayLoadError(RuntimeError):
     """Raised when no usable Red Pitaya overlay backend could be loaded."""
+
+
+def ensure_redpitaya_python_path() -> List[str]:
+    """Inject likely Red Pitaya python package paths into sys.path.
+
+    On some OS images, the bundled `redpitaya` python package is installed in
+    `/opt/redpitaya/...` but not exposed through PYTHONPATH for plain SSH
+    shells. This helper discovers those directories and prepends them to
+    `sys.path` so imports work regardless of the shell startup context.
+    """
+
+    added: List[str] = []
+
+    def _add(path: Path) -> None:
+        as_str = str(path)
+        if path.is_dir() and as_str not in sys.path:
+            sys.path.insert(0, as_str)
+            added.append(as_str)
+
+    for candidate in KNOWN_REDPITAYA_PYTHON_PATHS:
+        _add(candidate)
+
+    for root in (Path("/opt/redpitaya/lib"), Path("/opt/redpitaya")):
+        if not root.exists():
+            continue
+        for site_pkg in sorted(root.glob("python*/site-packages")):
+            _add(site_pkg)
+        for dist_pkg in sorted(root.glob("python*/dist-packages")):
+            _add(dist_pkg)
+
+    return added
 
 
 def _safe_read_text(path: Path) -> Optional[str]:
