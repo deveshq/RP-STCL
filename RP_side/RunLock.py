@@ -2,8 +2,8 @@
 
 import os
 
-from RP_Lock import RP_Server
-
+host, port = '192.168.0.101', 5000
+Lock = RP_Server(host, port, 5065, RP_mode = 'scan')
 
 host = os.environ.get("RP_LOCK_HOST", "0.0.0.0")
 port = int(os.environ.get("RP_LOCK_PORT", "5000"))
