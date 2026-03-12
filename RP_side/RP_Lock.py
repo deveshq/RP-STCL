@@ -5,12 +5,64 @@ Created on Thu May 12 17:17:08 2022
 @author: epultinevicius
 """
 
-from redpitaya.overlay.mercury import mercury as overlay
-import socket, selectors, traceback, libserver
+import socket
+import selectors
+import traceback
+import importlib.util
+from pathlib import Path
+
+
+def _import_local_module(module_name):
+    module_path = Path(__file__).resolve().parent / f"{module_name}.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    import libserver
+except ImportError:
+    try:
+        from . import libserver
+    except ImportError:
+        libserver = _import_local_module("libserver")
+
+try:
+    from rp_compat import (
+        OverlayLoadError,
+        calibration_available,
+        ensure_legacy_uio_symlinks,
+        load_overlay,
+    )
+except ImportError:
+    try:
+        from .rp_compat import (
+            OverlayLoadError,
+            calibration_available,
+            ensure_legacy_uio_symlinks,
+            load_overlay,
+        )
+    except ImportError:
+        _rp_compat = _import_local_module("rp_compat")
+        OverlayLoadError = _rp_compat.OverlayLoadError
+        calibration_available = _rp_compat.calibration_available
+        ensure_legacy_uio_symlinks = _rp_compat.ensure_legacy_uio_symlinks
+        load_overlay = _rp_compat.load_overlay
+
 import numpy as np
 from time import perf_counter, sleep
-from peak_finders import SG_array, peak_finders
 from copy import deepcopy
+
+try:
+    from peak_finders import SG_array, peak_finders
+except ImportError:
+    try:
+        from .peak_finders import SG_array, peak_finders
+    except ImportError:
+        _peak_finders = _import_local_module("peak_finders")
+        SG_array = _peak_finders.SG_array
+        peak_finders = _peak_finders.peak_finders
 
 
 class Receiver:
@@ -419,7 +471,22 @@ class PID:
 class RP:  # handles the functionality of the redpitaya
     def __init__(self, mode="scan"):
         # SETUP HARDWARE
-        fpga = overlay()  # established 'connection' with hardware
+        self.uio_aliases = ensure_legacy_uio_symlinks()
+        self.calibration_enabled = calibration_available()
+        try:
+            fpga, self.overlay_name = load_overlay()
+        except OverlayLoadError as exc:
+            raise RuntimeError(
+                "Could not initialize Red Pitaya FPGA overlay. "
+                "Set RP_OVERLAY_NAME if auto-detection picked the wrong overlay. "
+                f"Details: {exc}"
+            ) from exc
+        print(f"Using overlay: {self.overlay_name}")
+        if not self.calibration_enabled:
+            print(
+                "Warning: CLB calibration interface not detected. "
+                "Using driver defaults so acquisition and generation can still start."
+            )
         self.osc = [fpga.osc(ch, 1.0) for ch in range(2)]
         self.gen_ramp = fpga.gen(1)
         self.gen_trig = fpga.gen(0)
