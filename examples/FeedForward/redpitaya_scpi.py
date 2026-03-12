@@ -31,8 +31,12 @@ class scpi (object):
             print('SCPI >> connect({!s:s}:{:d}) failed: {!s:s}'.format(host, port, e))
 
     def __del__(self):
-        if self._socket is not None:
-            self._socket.close()
+        sock = getattr(self, "_socket", None)
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
         self._socket = None
 
     def close(self):
