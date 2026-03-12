@@ -7,6 +7,7 @@ import importlib
 import inspect
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -17,9 +18,49 @@ SYSFS_UIO_GLOB = "/sys/class/uio/uio*"
 
 LEGACY_UIO_NAMES = ("clb", "gen", "osc", "scope", "la")
 
+KNOWN_REDPITAYA_PYTHON_PATHS = (
+    Path("/opt/redpitaya/lib/python"),
+    Path("/opt/redpitaya/lib/python3"),
+    Path("/opt/redpitaya/lib/python3.10"),
+    Path("/opt/redpitaya/lib/python3.11"),
+    Path("/opt/redpitaya/lib/python3.12"),
+    Path("/opt/redpitaya/lib/python/site-packages"),
+)
+
 
 class OverlayLoadError(RuntimeError):
     """Raised when no usable Red Pitaya overlay backend could be loaded."""
+
+
+def ensure_redpitaya_python_path() -> List[str]:
+    """Inject likely Red Pitaya python package paths into sys.path.
+
+    On some OS images, the bundled `redpitaya` python package is installed in
+    `/opt/redpitaya/...` but not exposed through PYTHONPATH for plain SSH
+    shells. This helper discovers those directories and prepends them to
+    `sys.path` so imports work regardless of the shell startup context.
+    """
+
+    added: List[str] = []
+
+    def _add(path: Path) -> None:
+        as_str = str(path)
+        if path.is_dir() and as_str not in sys.path:
+            sys.path.insert(0, as_str)
+            added.append(as_str)
+
+    for candidate in KNOWN_REDPITAYA_PYTHON_PATHS:
+        _add(candidate)
+
+    for root in (Path("/opt/redpitaya/lib"), Path("/opt/redpitaya")):
+        if not root.exists():
+            continue
+        for site_pkg in sorted(root.glob("python*/site-packages")):
+            _add(site_pkg)
+        for dist_pkg in sorted(root.glob("python*/dist-packages")):
+            _add(dist_pkg)
+
+    return added
 
 
 def _safe_read_text(path: Path) -> Optional[str]:
@@ -141,18 +182,30 @@ def _instantiate_overlay(overlay_cls, overlay_name: str):
 
 
 def load_overlay(preferred: Optional[str] = None):
+    ensure_redpitaya_python_path()
+
     overlay_name = select_overlay_name(preferred)
     _run_overlay_loader(overlay_name)
 
     errors = []
-    try:
-        mercury_mod = importlib.import_module("redpitaya.overlay.mercury")
-        mercury_cls = getattr(mercury_mod, "mercury")
-        return _instantiate_overlay(mercury_cls, overlay_name), overlay_name
-    except Exception as exc:
-        errors.append(f"redpitaya.overlay.mercury: {exc}")
+    for module_name, class_name in (
+        ("redpitaya.overlay.mercury", "mercury"),
+        ("overlay.mercury", "mercury"),
+        ("mercury", "mercury"),
+    ):
+        try:
+            mercury_mod = importlib.import_module(module_name)
+            mercury_cls = getattr(mercury_mod, class_name)
+            return _instantiate_overlay(mercury_cls, overlay_name), overlay_name
+        except Exception as exc:
+            errors.append(f"{module_name}: {exc}")
 
-    for module_name in (f"redpitaya.overlay.{overlay_name}", "redpitaya.overlay"):
+    for module_name in (
+        f"redpitaya.overlay.{overlay_name}",
+        "redpitaya.overlay",
+        f"overlay.{overlay_name}",
+        "overlay",
+    ):
         try:
             mod = importlib.import_module(module_name)
         except Exception as exc:
@@ -170,5 +223,7 @@ def load_overlay(preferred: Optional[str] = None):
 
     raise OverlayLoadError(
         "Unable to import a compatible redpitaya overlay backend. "
-        f"Tried overlay '{overlay_name}'. Errors: {'; '.join(errors[:4])}"
+        f"Tried overlay '{overlay_name}'. Errors: {'; '.join(errors[:4])}. "
+        "If running over SSH, ensure PYTHONPATH includes the Red Pitaya "
+        "python package location under /opt/redpitaya."
     )
