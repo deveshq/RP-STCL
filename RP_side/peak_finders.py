@@ -24,7 +24,7 @@ def SG_array(window_size = 21, order = 2, deriv=0, rate=1): # based on https://s
     # precompute coefficients
     half_window = (window_size -1) // 2
     order_range = range(order+1)
-    b = np.mat([[k**i for i in order_range] for k in range(-half_window, half_window+1)])
+    b = np.asmatrix([[k**i for i in order_range] for k in range(-half_window, half_window+1)])
     m = np.linalg.pinv(b).A[deriv] * rate**deriv * factorial(deriv)
     return m
 

@@ -8,10 +8,10 @@ except ImportError:
     from .RP_Lock import RP_Server
 
 
-host = os.environ.get("RP_LOCK_HOST", "0.0.0.0")
+host = os.environ.get("RP_LOCK_HOST", "192.168.0.101")
 port = int(os.environ.get("RP_LOCK_PORT", "5000"))
 loop_port = int(os.environ.get("RP_LOCK_LOOP_PORT", "5065"))
-mode = os.environ.get("RP_LOCK_MODE", "monitor")
+mode = os.environ.get("RP_LOCK_MODE", "scan")
 
 Lock = RP_Server(host, port, loop_port, RP_mode=mode)
 Lock.setup_server(loop=False)
