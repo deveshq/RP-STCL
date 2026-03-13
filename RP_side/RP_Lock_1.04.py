@@ -1,57 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-RP_Lock_os2.py  —  OS 2.x port of RP_Lock.py
-=============================================
-Original author : epultinevicius (LangenGroup)
-Port            : OS 2.x / rp module (SWIG wrapper around _rp_py C extension)
+Created on Thu May 12 17:17:08 2022
 
-What changed vs the original RP_Lock.py
-----------------------------------------
-1.  Import: `from redpitaya.overlay.mercury import mercury as overlay`
-    replaced by `import rp` + `rp.rp_Init()`.
-
-2.  Class `_GenProxy`  (NEW)
-    A thin wrapper that gives the rest of the code the same attribute-assignment
-    interface as the mercury gen objects:
-        gen.offset    = x  →  rp.rp_GenOffset(ch, x)
-        gen.amplitude = x  →  rp.rp_GenAmp(ch, x)
-        gen.reset()        →  rp.rp_GenResetChannelSM(ch)
-        gen.start_trigger()→  rp.rp_GenTriggerOnly(ch)
-    Without this proxy every `gen_ramp.offset = val` write in RP_Lock and
-    RP_Server would need editing — this keeps those classes untouched.
-
-3.  Class `_GpioProxy`  (NEW)
-    Wraps rp.rp_DpinGetState() so that ext_trig1.read() / ext_trig2.read()
-    still return a plain bool, matching the original mercury gpio contract.
-
-4.  Class `RP`  (REWRITTEN)
-    Hardware abstraction layer — the only class that touches the rp module.
-    Trigger source: RP_TRIG_SRC_AWG_PE (confirmed working on OS 2.x board
-    without any external loopback cable — AWG fires ADC internally).
-    Burst period: computed in microseconds from sample count and clock rate.
-    VALIDATE tag marks the period formula that should be verified on hardware.
-
-5.  mode="lock" and mode="monitor" in RP.__init__
-    Raise NotImplementedError until Phase 1b/1c are complete.
-
-6.  All other classes (Receiver, reaction_loop, RP_Server, PID, RP_Lock)
-    are VERBATIM copies of the originals — zero logic changes.
-
-Hardware assumptions (confirmed by board_test.py on rp-f0efbb, OS 2.07):
-    - ADC_BUFFER_SIZE = DAC_BUFFER_SIZE = 16384
-    - RP_TRIG_SRC_AWG_PE fires immediately when generator is triggered
-    - RP_DEC_16 enum accepted and reads back as 16
-    - GPIO DIO0_P / DIO0_N readable as inputs
-
-VALIDATE items (need hardware confirmation with signals connected):
-    - Burst period formula: period_us = int(2 * dec * N_gen * 8e-3)
-      At 125 MHz, 1 sample = 8 ns = 8e-3 µs.
-      For dec=16, N_gen=16384: period_us = 4194 µs ≈ 4.2 ms per scan cycle.
-    - Ramp amplitude 0.5 V peak — verify piezo scan range is appropriate.
-    - Trigger delay = N (all post-trigger) — verify waveform alignment.
+@author: epultinevicius
 """
 
-import rp
+from redpitaya.overlay.mercury import mercury as overlay
 import socket, selectors, traceback, libserver
 import numpy as np
 from time import perf_counter, sleep
@@ -59,132 +13,6 @@ from peak_finders import SG_array, peak_finders
 from copy import deepcopy
 
 
-# ---------------------------------------------------------------------------
-# Decimation integer → rp enum lookup table
-# Covers all values that set_dec() might receive from settings or the client.
-# ---------------------------------------------------------------------------
-_DEC_MAP = {
-    1:     rp.RP_DEC_1,
-    2:     rp.RP_DEC_2,
-    4:     rp.RP_DEC_4,
-    8:     rp.RP_DEC_8,
-    16:    rp.RP_DEC_16,
-    32:    rp.RP_DEC_32,
-    64:    rp.RP_DEC_64,
-    128:   rp.RP_DEC_128,
-    256:   rp.RP_DEC_256,
-    512:   rp.RP_DEC_512,
-    1024:  rp.RP_DEC_1024,
-    2048:  rp.RP_DEC_2048,
-    4096:  rp.RP_DEC_4096,
-    8192:  rp.RP_DEC_8192,
-    16384: rp.RP_DEC_16384,
-    32768: rp.RP_DEC_32768,
-    65536: rp.RP_DEC_65536,
-}
-
-# Channel constants — named clearly to avoid confusion with osc channel indices
-_CH = {
-    0: rp.RP_CH_1,   # gen index 0 (gen_trig) → Out1 → RP_CH_1
-    1: rp.RP_CH_2,   # gen index 1 (gen_ramp) → Out2 → RP_CH_2
-}
-
-# ADC channel constants — osc index 0 → In1, osc index 1 → In2
-_ACQ_CH = {
-    0: rp.RP_CH_1,   # osc[0] → In1 (cavity transmission)
-    1: rp.RP_CH_2,   # osc[1] → In2 (not used for cavity mode)
-}
-
-
-# ---------------------------------------------------------------------------
-# _GenProxy
-# ---------------------------------------------------------------------------
-class _GenProxy:
-    """
-    Proxy object that gives the rest of the code the same attribute-assignment
-    interface as the mercury gen objects, while dispatching to rp_Gen*() calls.
-
-    Attributes supported (matching what RP_Lock / RP_Server write):
-        .offset     → rp.rp_GenOffset(ch, value)
-        .amplitude  → rp.rp_GenAmp(ch, value)
-
-    Methods supported:
-        .reset()          → rp.rp_GenResetChannelSM(ch)
-        .start_trigger()  → rp.rp_GenTriggerOnly(ch)
-    """
-
-    def __init__(self, gen_index):
-        """
-        Parameters
-        ----------
-        gen_index : int
-            0 for gen_trig (Out1 / RP_CH_1), 1 for gen_ramp (Out2 / RP_CH_2).
-        """
-        self._ch = _CH[gen_index]
-        self._offset = 0.0
-        self._amplitude = 0.0
-
-    # --- attribute writes intercepted via __setattr__ ---
-
-    def __setattr__(self, name, value):
-        if name == "offset":
-            rp.rp_GenOffset(self._ch, float(value))
-            object.__setattr__(self, "_offset", float(value))
-        elif name == "amplitude":
-            rp.rp_GenAmp(self._ch, float(value))
-            object.__setattr__(self, "_amplitude", float(value))
-        else:
-            object.__setattr__(self, name, value)
-
-    # --- attribute reads ---
-
-    @property
-    def offset(self):
-        return self._offset
-
-    @property
-    def amplitude(self):
-        return self._amplitude
-
-    # --- methods ---
-
-    def reset(self):
-        rp.rp_GenResetChannelSM(self._ch)
-
-    def start_trigger(self):
-        rp.rp_GenTriggerOnly(self._ch)
-
-
-# ---------------------------------------------------------------------------
-# _GpioProxy
-# ---------------------------------------------------------------------------
-class _GpioProxy:
-    """
-    Proxy object so that ext_trig1.read() / ext_trig2.read() return a plain
-    bool, matching the mercury gpio contract used in check_gpio_ext_trig().
-
-    Original:  fpga.gpio("p", 0, "in").read()  →  bool
-    OS 2.x:    rp.rp_DpinGetState(pin)          →  (retcode, RP_HIGH|RP_LOW)
-    """
-
-    def __init__(self, pin):
-        """
-        Parameters
-        ----------
-        pin : rp pin constant
-            e.g. rp.RP_DIO0_P or rp.RP_DIO0_N
-        """
-        self._pin = pin
-        rp.rp_DpinSetDirection(pin, rp.RP_IN)
-
-    def read(self):
-        _ret, state = rp.rp_DpinGetState(self._pin)
-        return state == rp.RP_HIGH
-
-
-# ---------------------------------------------------------------------------
-# Receiver  (VERBATIM from original)
-# ---------------------------------------------------------------------------
 class Receiver:
     def __init__(self, addr, action_dict={}):
         self.sel = selectors.DefaultSelector()
@@ -291,9 +119,6 @@ class Receiver:
         return "Stopped!"
 
 
-# ---------------------------------------------------------------------------
-# reaction_loop  (VERBATIM from original)
-# ---------------------------------------------------------------------------
 class reaction_loop(Receiver):  #### USE THIS FOR THE LOCKING LOOP
     def __init__(self, addr):
         action_dict = {
@@ -318,9 +143,6 @@ class reaction_loop(Receiver):  #### USE THIS FOR THE LOCKING LOOP
         self.start_server()
 
 
-# ---------------------------------------------------------------------------
-# RP_Server  (VERBATIM from original)
-# ---------------------------------------------------------------------------
 class RP_Server(Receiver):  # handles socket communication from redpitaya side
     def __init__(self, host, port, port2, RP_mode="scan"):
         Receiver.__init__(
@@ -551,9 +373,6 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
             return "Done"  # self.lock.acquisition.tolist()
 
 
-# ---------------------------------------------------------------------------
-# PID  (VERBATIM from original)
-# ---------------------------------------------------------------------------
 class PID:
     def __init__(self, P=0, I=0, D=0, I_val=0, limit=[-1, 1]):
         self.P = P
@@ -597,248 +416,179 @@ class PID:
         self.e_prev, self.t_prev = None, None
 
 
-# ---------------------------------------------------------------------------
-# RP  (REWRITTEN for OS 2.x)
-# ---------------------------------------------------------------------------
-class RP:
-    """
-    Hardware abstraction layer for RedPitaya STEMlab 125-14, OS 2.x.
-
-    Replaces the mercury-based implementation with direct rp module calls.
-    The public interface (gen_ramp, gen_trig, ext_trig1, ext_trig2, times, N,
-    acquire(), acquire_ch(), set_dec(), trigger()) is preserved exactly so that
-    RP_Lock (which inherits from RP) needs no changes.
-
-    Supported modes
-    ---------------
-    "scan"    : Cavity RP — Out1=square wave trigger, Out2=ramp, In1=signal.
-    "lock"    : Laser RP  — NOT YET PORTED (raises NotImplementedError).
-    "monitor" : Monitor RP— NOT YET PORTED (raises NotImplementedError).
-    """
-
+class RP:  # handles the functionality of the redpitaya
     def __init__(self, mode="scan"):
-        if mode not in ("scan",):
-            raise NotImplementedError(
-                "RP mode '{}' is not yet ported to OS 2.x. "
-                "Only mode='scan' is currently supported.".format(mode)
-            )
+        # SETUP HARDWARE
+        fpga = overlay()  # established 'connection' with hardware
+        self.osc = [fpga.osc(ch, 1.0) for ch in range(2)]
+        self.gen_ramp = fpga.gen(1)
+        self.gen_trig = fpga.gen(0)
+        self.GPIO = fpga.gpio
 
-        # --- init rp module ---
-        ret = rp.rp_Init()
-        if ret != rp.RP_OK:
-            raise RuntimeError("rp_Init() failed with code {}".format(ret))
-        rp.rp_Reset()
+        # configure gpio
+        self.ext_trig1 = self.GPIO(
+            "p", 0, "in"
+        )  # use pin DIO0_p (EXT TRIG.) for output1
+        self.ext_trig2 = self.GPIO("n", 0, "in")  # use pint DIO0_n for oiutput2
 
-        # --- proxy objects — preserve the original attribute interface ---
-        # gen_trig = fpga.gen(0) → Out1 → RP_CH_1
-        # gen_ramp = fpga.gen(1) → Out2 → RP_CH_2
-        self.gen_trig = _GenProxy(0)
-        self.gen_ramp = _GenProxy(1)
+        self.sync_src = fpga.sync_src
+        self.trig_src = fpga.trig_src
 
-        # --- GPIO ext trigger pins ---
-        # DIO0_P → ext_trig1 (enable/disable Slave1 PID)
-        # DIO0_N → ext_trig2 (enable/disable Slave2 PID)
-        self.ext_trig1 = _GpioProxy(rp.RP_DIO0_P)
-        self.ext_trig2 = _GpioProxy(rp.RP_DIO0_N)
+        N_osc = self.osc[0].buffer_size
+        N_gen = self.gen_ramp.buffer_size
+        dec = int(2**4)
+        triangle = self.gen_ramp.sawtooth()
+        square = self.gen_trig.square()
 
-        # --- buffer sizes (confirmed 16384 on board) ---
-        self.N = rp.ADC_BUFFER_SIZE        # 16384 — oscilloscope samples
-        N_gen  = rp.DAC_BUFFER_SIZE        # 16384 — generator samples
+        self.N = N_osc
+        dur = self.duration(dec)  # duration in seconds
+        self.times = np.linspace(0, dur - (8e-9 * dec), self.N) * 1e3  # in ms
 
-        # --- default decimation ---
-        dec = int(2 ** 4)   # 16, matching original and Cav.json / Default.json
+        self.osc_kwargs = dict(
+            decimation=dec,
+            length=N_osc,
+            trigger_pre=0,
+            trigger_post=N_osc,
+            sync_src=self.sync_src["gen1"],
+            trig_src=0,
+        )
 
-        # --- time axis (milliseconds, same formula as original) ---
-        dur = self._duration(dec)
-        self.times = np.linspace(0, dur - (8e-9 * dec), self.N) * 1e3  # ms
+        self.gen_ramp_kwargs = dict(
+            waveform=triangle,
+            amplitude=0.5,
+            offset=0,
+            enable=True,
+            mode="BURST",
+            burst_data_repetitions=int(
+                2 * dec
+            ),  # basically the decimation of the signal
+            burst_data_length=int(
+                N_gen
+            ),  # how much of the signals buffer should be used for the burst?
+            burst_period_length=int(2 * dec)
+            * N_gen,  # the full length of a period of the signal
+            burst_period_number=1,  # only one ramp at a time.
+        )
 
-        # --- configure acquisition ---
-        rp.rp_AcqReset()
-        rp.rp_AcqSetDecimation(_DEC_MAP[dec])
-        rp.rp_AcqSetGain(rp.RP_CH_1, rp.RP_LOW)   # In1: ±1 V  (cavity signal)
-        rp.rp_AcqSetGain(rp.RP_CH_2, rp.RP_LOW)   # In2: ±1 V
-        rp.rp_AcqSetAveraging(True)
-        # Trigger on AWG positive edge — confirmed working without loopback cable
-        rp.rp_AcqSetTriggerSrc(rp.RP_TRIG_SRC_AWG_PE)
-        # All samples post-trigger: trigger_pre=0, trigger_post=N
-        rp.rp_AcqSetTriggerDelay(self.N)
-        rp.rp_AcqStart()
+        self.gen_trig_kwargs = deepcopy(self.gen_ramp_kwargs)
+        self.gen_trig_kwargs["burst_data_repetitions"] = int(2 * dec)
+        self.gen_trig_kwargs["burst_data_length"] = int(N_gen)
+        self.gen_trig_kwargs["burst_period_length"] = int(2 * dec) * N_gen
+        self.gen_trig_kwargs["burst_period_number"] = 1
 
-        # --- configure generators (scan mode) ---
-        rp.rp_GenReset()
-        self._setup_gen_scan(dec, N_gen)
+        self.gen_dc_kwargs = dict(
+            waveform=triangle,
+            amplitude=0,
+            offset=0,
+            enable=True,
+            mode="PERIODIC",
+        )
 
+        for ch in range(2):
+            self.set_osc_ch(ch, **self.osc_kwargs)
+            self.set_osc_ch(
+                ch, sync_src=self.sync_src["osc1"], trig_src=self.trig_src["osc1"]
+            )  # set synchronysation to ch 2! The square wave goes in here!
+            self.osc[ch].start()
+        self.set_osc_ch(1, level=[-0.1, 0.1], edge="pos")  # trigger settings!
         self.mode = mode
+
+        if self.mode == "scan":  # Cavity lock only
+            # setup trigger square wave on out 1
+            self.set_mod(self.gen_trig, **self.gen_trig_kwargs)
+            self.set_mod(
+                self.gen_trig,
+                sync_src=self.sync_src["gen1"],
+                waveform=square,
+                offset=0.0,
+                amplitude=0.9,
+            )  # overwrite waveform to set a square wave signal
+            self.set_mod(
+                self.gen_ramp, **self.gen_ramp_kwargs
+            )  # setup cavity scan ramp on out2
+
+        elif self.mode == "lock":
+            self.set_mod(
+                self.gen_trig, **self.gen_dc_kwargs
+            )  # setup a dc signal on out1 for laser locking
+            self.set_mod(
+                self.gen_ramp, **self.gen_dc_kwargs
+            )  # setup a dc signal on out2 for laser locking
+            self.gen_trig.start_trigger()
+            self.gen_ramp.start_trigger()
         self.trigger_armed = False
 
-        # --- store dec for set_dec() ---
-        self._dec = dec
-        self._N_gen = N_gen
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _duration(self, dec):
-        """Acquisition duration in seconds. Same formula as original."""
-        return 8e-9 * self.N * dec
-
-    def _burst_period_us(self, dec, N_gen):
-        """
-        Burst period in microseconds.
-
-        VALIDATE: Original used burst_period_length = int(2*dec)*N_gen samples.
-        At 125 MHz ADC clock, 1 sample = 8 ns = 8e-3 µs.
-        period_us = 2 * dec * N_gen * 8e-3
-
-        For dec=16, N_gen=16384: period_us = 4194 µs (confirmed printed by
-        board_test.py — hardware validation with signal still pending).
-        """
-        return int(2 * dec * N_gen * 8e-3)  # VALIDATE on hardware with signal
-
-    def _setup_gen_scan(self, dec, N_gen):
-        """Configure Out1 (square wave trigger) and Out2 (ramp) for scan mode."""
-        period_us = self._burst_period_us(dec, N_gen)
-
-        # --- Out1: square wave trigger (gen_trig / RP_CH_1) ---
-        ch_trig = _CH[0]
-        rp.rp_GenWaveform(ch_trig, rp.RP_WAVEFORM_SQUARE)
-        rp.rp_GenAmp(ch_trig, 0.9)
-        rp.rp_GenOffset(ch_trig, 0.0)
-        rp.rp_GenMode(ch_trig, rp.RP_GEN_MODE_BURST)
-        rp.rp_GenBurstCount(ch_trig, 1)            # one cycle per burst
-        rp.rp_GenBurstRepetitions(ch_trig, 1)      # fire once per trigger
-        rp.rp_GenBurstPeriod(ch_trig, period_us)
-        rp.rp_GenTriggerSource(ch_trig, rp.RP_GEN_TRIG_SRC_INTERNAL)
-        rp.rp_GenOutEnable(ch_trig)
-
-        # --- Out2: ramp (gen_ramp / RP_CH_2) ---
-        ch_ramp = _CH[1]
-        rp.rp_GenWaveform(ch_ramp, rp.RP_WAVEFORM_RAMP_UP)
-        rp.rp_GenAmp(ch_ramp, 0.5)
-        rp.rp_GenOffset(ch_ramp, 0.0)
-        rp.rp_GenMode(ch_ramp, rp.RP_GEN_MODE_BURST)
-        rp.rp_GenBurstCount(ch_ramp, 1)
-        rp.rp_GenBurstRepetitions(ch_ramp, 1)
-        rp.rp_GenBurstPeriod(ch_ramp, period_us)
-        rp.rp_GenTriggerSource(ch_ramp, rp.RP_GEN_TRIG_SRC_INTERNAL)
-        rp.rp_GenOutEnable(ch_ramp)
-
-    # ------------------------------------------------------------------
-    # Public interface — matching the original RP class
-    # ------------------------------------------------------------------
-
-    def _duration(self, dec):
-        return 8e-9 * self.N * dec
+    def duration(self, dec):
+        return 8e-9 * self.N * dec  # duration in seconds
 
     def set_dec(self, dec):
-        """Update decimation at runtime. dec must be a power of 2 up to 65536."""
-        dec = int(dec)
-        if dec not in _DEC_MAP:
-            raise ValueError(
-                "Decimation {} is not valid. Must be one of: {}".format(
-                    dec, sorted(_DEC_MAP.keys())
-                )
-            )
-        # Update oscilloscope decimation
-        rp.rp_AcqSetDecimation(_DEC_MAP[dec])
-
-        # Update generator burst period (scan mode only)
+        kwargs = dict(
+            burst_data_repetitions=int(
+                2 * dec
+            ),  # basically the decimation of the signal
+            burst_period_length=int(2 * dec)
+            * self.N,  # the full length of a period of the signal
+        )
+        # set awg decimation
         if self.mode == "scan":
-            period_us = self._burst_period_us(dec, self._N_gen)
-            for ch in (_CH[0], _CH[1]):
-                rp.rp_GenBurstPeriod(ch, period_us)
-
-        # Update time axis
-        dur = self._duration(dec)
+            self.set_mod(self.gen_ramp, **kwargs)
+            self.set_mod(self.gen_trig, **kwargs)
+        # set oscilloscope decimation
+        for ch in range(2):
+            self.set_osc_ch(ch, decimation=dec)
+        dur = self.duration(dec)
         self.times = np.linspace(0, dur - (8e-9 * dec), self.N) * 1e3
-        self._dec = dec
+
+    def set_mod(self, mod, **kwargs):  # set module!
+        for key, value in kwargs.items():
+            setattr(mod, key, value)
+
+    def set_osc_ch(self, ch, **kwargs):
+        self.set_mod(self.osc[ch], **kwargs)
 
     def trigger(self):
-        """
-        Arm the ADC and fire the generators, then wait for trigger.
-
-        Original logic preserved:
-          - If not already armed, reset and restart the ADC.
-          - In scan mode, reset and re-fire gen_ramp (Out2) each cycle so the
-            ramp restarts from zero. gen_trig (Out1) fires simultaneously and
-            its AWG positive edge triggers the ADC.
-          - Wait until ADC reports RP_TRIG_STATE_TRIGGERED.
-        """
         if not self.trigger_armed:
-            rp.rp_AcqStop()
-            rp.rp_AcqSetTriggerSrc(rp.RP_TRIG_SRC_AWG_PE)
-            rp.rp_AcqSetTriggerDelay(self.N)
-            rp.rp_AcqStart()
-
+            self.osc[1].reset()
+            self.osc[1].start()
         if self.mode == "scan":
-            # Fire both generators together so the ramp and trigger are in sync.
-            # Reset state machines first to ensure they start from the beginning.
-            rp.rp_GenResetChannelSM(_CH[0])   # gen_trig (Out1, square wave)
-            rp.rp_GenTriggerOnly(_CH[0])
-            rp.rp_GenResetChannelSM(_CH[1])   # gen_ramp (Out2, ramp)
-            rp.rp_GenTriggerOnly(_CH[1])
+            self.gen_ramp.reset()
+            self.gen_ramp.start_trigger()
 
-        # Wait for ADC trigger — mirrors original `while osc[1].status_run(): pass`
-        while True:
-            _ret, state = rp.rp_AcqGetTriggerState()
-            if state == rp.RP_TRIG_STATE_TRIGGERED:
-                break
+        while self.osc[1].status_run():
+            pass
+
+    ##################### acquisition functions ###############################
 
     def acquire(self):
-        """
-        Acquire both channels. Returns np.array([times, ch1_data, ch2_data]).
-        Matches original return shape exactly.
-        """
         self.trigger()
-        _ret, trig_pos = rp.rp_AcqGetWritePointerAtTrig()
-
-        ch1 = np.zeros(self.N, dtype=np.float32)
-        ch2 = np.zeros(self.N, dtype=np.float32)
-        rp.rp_AcqGetDataVNP(rp.RP_CH_1, trig_pos, ch1)
-        rp.rp_AcqGetDataVNP(rp.RP_CH_2, trig_pos, ch2)
-
-        # Re-arm for next cycle (mirrors original osc[1].reset() + osc[1].start())
-        rp.rp_AcqStop()
-        rp.rp_AcqSetTriggerSrc(rp.RP_TRIG_SRC_AWG_PE)
-        rp.rp_AcqSetTriggerDelay(self.N)
-        rp.rp_AcqStart()
+        ch1 = self.osc[0].data(self.N)
+        ch2 = self.osc[1].data(self.N)
+        self.osc[1].reset()
+        self.osc[1].start()
+        # if self.times[-1] > 60: # if decimation roughly >= 2**9
+        #    sleep(self.times[-1]*1e-3 * 1.2)
         self.trigger_armed = True
-
         self.acquisition = np.array([self.times, ch1, ch2])
         return self.acquisition
 
     def acquire_ch(self, ch):
-        """
-        Acquire a single channel. ch=0 → In1 (cavity), ch=1 → In2.
-        Returns 1-D numpy array of float32 voltages.
-        """
         self.trigger()
-        _ret, trig_pos = rp.rp_AcqGetWritePointerAtTrig()
-
-        arr = np.zeros(self.N, dtype=np.float32)
-        rp.rp_AcqGetDataVNP(_ACQ_CH[ch], trig_pos, arr)
-
-        # Re-arm for next cycle
-        rp.rp_AcqStop()
-        rp.rp_AcqSetTriggerSrc(rp.RP_TRIG_SRC_AWG_PE)
-        rp.rp_AcqSetTriggerDelay(self.N)
-        rp.rp_AcqStart()
+        dat = self.osc[ch].data(int(self.N))
+        self.osc[1].reset()
+        self.osc[1].start()
+        # if self.times[-1] > 60: # if decimation roughly >= 2**9
+        #    sleep(self.times[-1]*1e-3 * 1.2)
         self.trigger_armed = True
-
-        return arr
+        # self.acquisition = np.array([self.times, dat])
+        return dat
 
     def close(self):
-        """Release hardware resources."""
-        rp.rp_GenOutDisable(_CH[0])
-        rp.rp_GenOutDisable(_CH[1])
-        rp.rp_AcqStop()
-        rp.rp_Release()
+        for ch in range(2):
+            del self.osc[ch]
+        del self.gen_ramp
+        del self.gen_laser
 
 
-# ---------------------------------------------------------------------------
-# RP_Lock  (VERBATIM from original)
-# ---------------------------------------------------------------------------
 class RP_Lock(RP, reaction_loop):
     def __init__(self, addr, mode="lock"):
         RP.__init__(self, mode=mode)
