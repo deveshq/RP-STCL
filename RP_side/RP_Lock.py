@@ -32,6 +32,7 @@ try:
     from rp_compat import (
         OverlayLoadError,
         calibration_available,
+        describe_uio_devices,
         ensure_legacy_uio_symlinks,
         load_overlay,
     )
@@ -40,6 +41,7 @@ except ImportError:
         from .rp_compat import (
             OverlayLoadError,
             calibration_available,
+            describe_uio_devices,
             ensure_legacy_uio_symlinks,
             load_overlay,
         )
@@ -47,6 +49,7 @@ except ImportError:
         _rp_compat = _import_local_module("rp_compat")
         OverlayLoadError = _rp_compat.OverlayLoadError
         calibration_available = _rp_compat.calibration_available
+        describe_uio_devices = _rp_compat.describe_uio_devices
         ensure_legacy_uio_symlinks = _rp_compat.ensure_legacy_uio_symlinks
         load_overlay = _rp_compat.load_overlay
 
@@ -472,6 +475,8 @@ class RP:  # handles the functionality of the redpitaya
     def __init__(self, mode="scan"):
         # SETUP HARDWARE
         self.uio_aliases = ensure_legacy_uio_symlinks()
+        self.detected_uio_devices = describe_uio_devices()
+        print(f"Detected UIO devices before calibration init: {self.detected_uio_devices}")
         self.calibration_enabled = calibration_available()
         try:
             fpga, self.overlay_name = load_overlay()
@@ -484,9 +489,10 @@ class RP:  # handles the functionality of the redpitaya
         print(f"Using overlay: {self.overlay_name}")
         if not self.calibration_enabled:
             print(
-                "Warning: CLB calibration interface not detected. "
+                "Warning: CLB calibration interface (/dev/uio/clb) not detected. "
                 "Using driver defaults so acquisition and generation can still start."
             )
+            print(f"Available UIO devices: {self.detected_uio_devices}")
         self.osc = [fpga.osc(ch, 1.0) for ch in range(2)]
         self.gen_ramp = fpga.gen(1)
         self.gen_trig = fpga.gen(0)
