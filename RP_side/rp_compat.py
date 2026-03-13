@@ -27,6 +27,18 @@ KNOWN_REDPITAYA_PYTHON_PATHS = (
     Path("/opt/redpitaya/lib/python/site-packages"),
 )
 
+API_UIO_NAME = "api"
+API_UIO_DEVICE = "/dev/uio0"
+
+# FPGA register base addresses (v0.94 layout)
+FPGA_BASE_ADDR = 0x40000000
+FPGA_REGSETS = {
+    "hk": 0x00000000,
+    "osc": 0x00100000,
+    "asg": 0x00200000,
+    "pid": 0x00300000,
+    "ams": 0x00400000,
+}
 
 class OverlayLoadError(RuntimeError):
     """Raised when no usable Red Pitaya overlay backend could be loaded."""
@@ -77,9 +89,88 @@ def discover_uio_devices() -> Dict[str, str]:
         name = _safe_read_text(uio_path / "name")
         if name:
             mapping[name] = f"/dev/uio{index}"
+    mapping.setdefault(API_UIO_NAME, API_UIO_DEVICE)
     return mapping
 
+_global_uio_fd = None
+_global_uio_mmap = None
 
+
+def get_shared_uio():
+    """
+    Open /dev/uio0 once and reuse the mapping across drivers.
+    """
+    global _global_uio_fd, _global_uio_mmap
+
+    if _global_uio_fd is not None:
+        return _global_uio_fd, _global_uio_mmap
+
+    import mmap
+
+    device = API_UIO_DEVICE
+
+    try:
+        fd = os.open(device, os.O_RDWR | os.O_SYNC)
+    except OSError as exc:
+        raise RuntimeError(f"Unable to open Red Pitaya API UIO device {device}: {exc}")
+
+    try:
+        mm = mmap.mmap(fd, 0x1000000, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+    except Exception as exc:
+        os.close(fd)
+        raise RuntimeError(f"Unable to mmap Red Pitaya FPGA registers: {exc}")
+
+    _global_uio_fd = fd
+    _global_uio_mmap = mm
+
+    return _global_uio_fd, _global_uio_mmap
+
+def get_regset(name: str):
+    """
+    Return mmap pointer offset for a specific FPGA register block.
+    """
+    _, mm = get_shared_uio()
+
+    if name not in FPGA_REGSETS:
+        raise ValueError(f"Unknown FPGA register block: {name}")
+
+    offset = FPGA_REGSETS[name]
+
+    return memoryview(mm)[offset:]
+
+# def ensure_legacy_uio_symlinks() -> Dict[str, str]:
+#     created: Dict[str, str] = {}
+#     mapping = discover_uio_devices()
+#     if not mapping:
+#         return created
+
+#     dev_uio_dir = Path("/dev/uio")
+#     try:
+#         dev_uio_dir.mkdir(parents=False, exist_ok=True)
+#     except OSError:
+#         return created
+
+#     for legacy in LEGACY_UIO_NAMES:
+#         # If board exposes unified API device, map everything to it
+#         if "api" in mapping and legacy not in mapping:
+#             target = mapping["api"]
+#         elif legacy in mapping:
+#             target = mapping[legacy]
+#         else:
+#             continue
+#         link = dev_uio_dir / legacy
+#         target = mapping[legacy]
+#         try:
+#             if link.is_symlink() and os.readlink(link) == target:
+#                 created[legacy] = target
+#                 continue
+#             if link.exists() or link.is_symlink():
+#                 link.unlink()
+#             link.symlink_to(target)
+#             created[legacy] = target
+#         except OSError:
+#             continue
+#     return created
 def ensure_legacy_uio_symlinks() -> Dict[str, str]:
     created: Dict[str, str] = {}
     mapping = discover_uio_devices()
@@ -93,20 +184,30 @@ def ensure_legacy_uio_symlinks() -> Dict[str, str]:
         return created
 
     for legacy in LEGACY_UIO_NAMES:
-        if legacy not in mapping:
+
+        if legacy in mapping:
+            target = mapping[legacy]
+        elif "api" in mapping:
+            target = mapping["api"]
+        else:
             continue
-        link = dev_uio_dir / legacy
-        target = mapping[legacy]
-        try:
-            if link.is_symlink() and os.readlink(link) == target:
-                created[legacy] = target
+
+        # Create both legacy and indexed names
+        for name in (legacy, f"{legacy}0"):
+
+            link = dev_uio_dir / name
+
+            try:
+                if link.is_symlink() and os.readlink(link) == target:
+                    created[name] = target
+                    continue
+                if link.exists() or link.is_symlink():
+                    link.unlink()
+                link.symlink_to(target)
+                created[name] = target
+            except OSError:
                 continue
-            if link.exists() or link.is_symlink():
-                link.unlink()
-            link.symlink_to(target)
-            created[legacy] = target
-        except OSError:
-            continue
+
     return created
 
 
@@ -183,7 +284,7 @@ def _instantiate_overlay(overlay_cls, overlay_name: str):
 
 def load_overlay(preferred: Optional[str] = None):
     ensure_redpitaya_python_path()
-
+    ensure_legacy_uio_symlinks()
     overlay_name = select_overlay_name(preferred)
     _run_overlay_loader(overlay_name)
 

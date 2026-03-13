@@ -232,6 +232,8 @@ class RP_connection:
                 with localpath.open("w", encoding="utf-8") as f:
                     f.writelines(lines)
             sftp.put(str(localpath), str(path))
+
+            print(f"Uploaded {key} to {hostname}:{path}")
         sftp.close()
         ssh.close()
 
