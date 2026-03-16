@@ -2,8 +2,8 @@
 
 import sys
 if sys.version_info < (3, 5):
-    raise RuntimeError(
-        "Python 3.5 or newer is required. Running: {}.{}.{}".format(
+host, port = '192.168.0.200', 5000
+Lock = RP_Server(host, port, 5065, RP_mode = 'scan')
             sys.version_info.major,
             sys.version_info.minor,
             sys.version_info.micro,
