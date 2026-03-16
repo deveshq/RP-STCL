@@ -45,8 +45,8 @@ def check_dec(dec):
     if not power.is_integer():
         print('dec setting must be a power of 2!')
         return False
-    elif not 0 <= power <= 16:  # rp module supports 2**0 to 2**16 (1 to 65536)
-        print('dec must be between 2**0 and 2**16!')
+    elif not 0 <= power <= 9: # in principle everything up to a power of 2**13 should work, but at some point the trigg
+        print('dec must be between 2**0 and 2**9!')
         return False
     else: 
         return True

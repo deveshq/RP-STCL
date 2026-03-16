@@ -612,15 +612,20 @@ class RP:
     Supported modes
     ---------------
     "scan"    : Cavity RP — Out1=square wave trigger, Out2=ramp, In1=signal.
-    "lock"    : Laser RP  — NOT YET PORTED (raises NotImplementedError).
-    "monitor" : Monitor RP— NOT YET PORTED (raises NotImplementedError).
+                Generators run in burst mode; ADC triggers on AWG positive edge.
+    "lock"    : Laser RP  — Out1=PID feedback Slave1, Out2=PID feedback Slave2,
+                In1=cavity signal. ADC triggers on AWG positive edge from the
+                cavity RP (received on the external trigger input or via the
+                internal AWG — same trigger source, no local ramp generated).
+    "monitor" : Monitor RP— In1=cavity signal only, no outputs driven.
+                ADC triggers on AWG positive edge from the cavity RP.
     """
 
     def __init__(self, mode="scan"):
-        if mode not in ("scan",):
-            raise NotImplementedError(
-                "RP mode '{}' is not yet ported to OS 2.x. "
-                "Only mode='scan' is currently supported.".format(mode)
+        if mode not in ("scan", "lock", "monitor"):
+            raise ValueError(
+                "RP mode '{}' is not valid. "
+                "Must be one of: 'scan', 'lock', 'monitor'.".format(mode)
             )
 
         # --- init rp module ---
@@ -652,24 +657,35 @@ class RP:
         dur = self._duration(dec)
         self.times = np.linspace(0, dur - (8e-9 * dec), self.N) * 1e3  # ms
 
-        # --- configure acquisition ---
+        # --- configure acquisition (all modes) ---
         rp.rp_AcqReset()
         rp.rp_AcqSetDecimation(_DEC_MAP[dec])
         rp.rp_AcqSetGain(rp.RP_CH_1, rp.RP_LOW)   # In1: ±1 V  (cavity signal)
         rp.rp_AcqSetGain(rp.RP_CH_2, rp.RP_LOW)   # In2: ±1 V
         rp.rp_AcqSetAveraging(True)
-        # Trigger on AWG positive edge — confirmed working without loopback cable
-        rp.rp_AcqSetTriggerSrc(rp.RP_TRIG_SRC_AWG_PE)
-        # All samples post-trigger: trigger_pre=0, trigger_post=N
-        rp.rp_AcqSetTriggerDelay(self.N)
-        rp.rp_AcqStart()
+        # Trigger source depends on mode:
+        #   scan    — ADC triggers on local AWG positive edge (Out1 square wave
+        #             fires the ADC on the same board directly).
+        #   lock    — cavity RP's Out1 square wave is routed to this board's In2;
+        #             ADC triggers on In2 (CHB) positive edge.
+        #   monitor — same wiring as lock; triggers on In2 positive edge.
+        if mode == "scan":
+            rp.rp_AcqSetTriggerSrc(rp.RP_TRIG_SRC_AWG_PE)
+        else:  # lock and monitor
+            rp.rp_AcqSetTriggerSrc(rp.RP_TRIG_SRC_CHB_PE)
 
-        # --- configure generators (scan mode) ---
+        # --- configure generators ---
         rp.rp_GenReset()
-        self._setup_gen_scan(dec, N_gen)
+        if mode == "scan":
+            # Out1: square wave trigger, Out2: piezo ramp — both in burst mode.
+            self._setup_gen_scan(dec, N_gen)
+        elif mode == "lock":
+            # Out1 and Out2 carry PID feedback to laser current mod inputs.
+            # Configured as DC continuous outputs; PID updates offset at runtime.
+            self._setup_gen_lock()
+        # monitor: no generator output needed; GenReset() already silences both.
 
         self.mode = mode
-        self.trigger_armed = False
 
         # --- store dec for set_dec() ---
         self._dec = dec
@@ -683,53 +699,89 @@ class RP:
         """Acquisition duration in seconds. Same formula as original."""
         return 8e-9 * self.N * dec
 
-    def _burst_period_us(self, dec, N_gen):
+    @property
+    def _trig_src(self):
         """
-        Burst period in microseconds.
-
-        VALIDATE: Original used burst_period_length = int(2*dec)*N_gen samples.
-        At 125 MHz ADC clock, 1 sample = 8 ns = 8e-3 µs.
-        period_us = 2 * dec * N_gen * 8e-3
-
-        For dec=16, N_gen=16384: period_us = 4194 µs (confirmed printed by
-        board_test.py — hardware validation with signal still pending).
+        Correct ADC trigger source for this board's mode.
+        scan    → RP_TRIG_SRC_AWG_PE  (local Out1 square wave)
+        lock    → RP_TRIG_SRC_CHB_PE  (cavity RP Out1 arrives on In2)
+        monitor → RP_TRIG_SRC_CHB_PE  (same wiring as lock)
         """
-        return int(2 * dec * N_gen * 8e-3)  # VALIDATE on hardware with signal
+        if self.mode == "scan":
+            return rp.RP_TRIG_SRC_AWG_PE
+        else:
+            return rp.RP_TRIG_SRC_CHB_PE
+
+    def _scan_freq_hz(self, dec):
+        """
+        Scan frequency in Hz for the continuous generators.
+
+        One scan cycle = one full ADC buffer = N * dec * 8 ns.
+        Both generators run at this frequency so their period matches
+        the acquisition window exactly — no dead time, no offset.
+        """
+        return 1.0 / self._duration(dec)   # _duration returns seconds
 
     def _setup_gen_scan(self, dec, N_gen):
-        """Configure Out1 (square wave trigger) and Out2 (ramp) for scan mode."""
-        period_us = self._burst_period_us(dec, N_gen)
+        """Configure Out1 (square wave trigger) and Out2 (ramp) for scan mode.
+
+        Both generators run in CONTINUOUS mode at the same frequency.
+        Frequency = 1 / acquisition_duration = 1 / (N * dec * 8 ns).
+        At dec=16, N=16384: freq ≈ 476 Hz, period ≈ 2.1 ms.
+
+        Out1: square wave — free-running, triggers the ADC on every positive
+              edge via RP_TRIG_SRC_AWG_PE. IN2 sees a clean square wave for
+              the full acquisition window.
+        Out2: ramp (RAMP_DOWN = physically rising on OS 2.x) — free-running
+              at the same frequency. No dead time. The PID updates its DC
+              offset via gen_ramp.offset between cycles.
+
+        No rp_GenTriggerOnly() calls are needed. trigger() just arms the ADC
+        and waits for the next positive edge of the free-running Out1.
+        """
+        freq_hz = self._scan_freq_hz(dec)
 
         # --- Out1: square wave trigger (gen_trig / RP_CH_1) ---
         ch_trig = _CH[0]
         rp.rp_GenWaveform(ch_trig, rp.RP_WAVEFORM_SQUARE)
+        rp.rp_GenFreqDirect(ch_trig, freq_hz)
         rp.rp_GenAmp(ch_trig, 0.9)
         rp.rp_GenOffset(ch_trig, 0.0)
-        rp.rp_GenMode(ch_trig, rp.RP_GEN_MODE_BURST)
-        rp.rp_GenBurstCount(ch_trig, 1)            # one cycle per burst
-        rp.rp_GenBurstRepetitions(ch_trig, 1)      # fire once per trigger
-        rp.rp_GenBurstPeriod(ch_trig, period_us)
+        rp.rp_GenMode(ch_trig, rp.RP_GEN_MODE_CONTINUOUS)
         rp.rp_GenTriggerSource(ch_trig, rp.RP_GEN_TRIG_SRC_INTERNAL)
         rp.rp_GenOutEnable(ch_trig)
 
         # --- Out2: ramp (gen_ramp / RP_CH_2) ---
         ch_ramp = _CH[1]
-        rp.rp_GenWaveform(ch_ramp, rp.RP_WAVEFORM_RAMP_UP)
+        rp.rp_GenWaveform(ch_ramp, rp.RP_WAVEFORM_RAMP_DOWN)  # OS 2.x: RAMP_DOWN is physically rising
+        rp.rp_GenFreqDirect(ch_ramp, freq_hz)
         rp.rp_GenAmp(ch_ramp, 0.5)
         rp.rp_GenOffset(ch_ramp, 0.0)
-        rp.rp_GenMode(ch_ramp, rp.RP_GEN_MODE_BURST)
-        rp.rp_GenBurstCount(ch_ramp, 1)
-        rp.rp_GenBurstRepetitions(ch_ramp, 1)
-        rp.rp_GenBurstPeriod(ch_ramp, period_us)
+        rp.rp_GenMode(ch_ramp, rp.RP_GEN_MODE_CONTINUOUS)
         rp.rp_GenTriggerSource(ch_ramp, rp.RP_GEN_TRIG_SRC_INTERNAL)
         rp.rp_GenOutEnable(ch_ramp)
+
+    def _setup_gen_lock(self):
+        """
+        Configure Out1 and Out2 as DC continuous outputs for laser lock mode.
+
+        In lock mode the PID controller writes its output to gen.offset at
+        runtime (via _GenProxy). The generator just needs to be alive in
+        continuous mode with zero amplitude so the DC offset is all that matters.
+        Out1 → Slave1 laser current mod input.
+        Out2 → Slave2 laser current mod input.
+        """
+        for ch in (_CH[0], _CH[1]):
+            rp.rp_GenWaveform(ch, rp.RP_WAVEFORM_DC)
+            rp.rp_GenAmp(ch, 0.0)
+            rp.rp_GenOffset(ch, 0.0)
+            rp.rp_GenMode(ch, rp.RP_GEN_MODE_CONTINUOUS)
+            rp.rp_GenTriggerSource(ch, rp.RP_GEN_TRIG_SRC_INTERNAL)
+            rp.rp_GenOutEnable(ch)
 
     # ------------------------------------------------------------------
     # Public interface — matching the original RP class
     # ------------------------------------------------------------------
-
-    def _duration(self, dec):
-        return 8e-9 * self.N * dec
 
     def set_dec(self, dec):
         """Update decimation at runtime. dec must be a power of 2 up to 65536."""
@@ -743,11 +795,11 @@ class RP:
         # Update oscilloscope decimation
         rp.rp_AcqSetDecimation(_DEC_MAP[dec])
 
-        # Update generator burst period (scan mode only)
+        # Update generator frequency (scan mode only — both are continuous)
         if self.mode == "scan":
-            period_us = self._burst_period_us(dec, self._N_gen)
-            for ch in (_CH[0], _CH[1]):
-                rp.rp_GenBurstPeriod(ch, period_us)
+            freq_hz = self._scan_freq_hz(dec)
+            rp.rp_GenFreqDirect(_CH[0], freq_hz)
+            rp.rp_GenFreqDirect(_CH[1], freq_hz)
 
         # Update time axis
         dur = self._duration(dec)
@@ -756,30 +808,22 @@ class RP:
 
     def trigger(self):
         """
-        Arm the ADC and fire the generators, then wait for trigger.
+        Arm the ADC and wait for the next trigger edge.
 
-        Original logic preserved:
-          - If not already armed, reset and restart the ADC.
-          - In scan mode, reset and re-fire gen_ramp (Out2) each cycle so the
-            ramp restarts from zero. gen_trig (Out1) fires simultaneously and
-            its AWG positive edge triggers the ADC.
-          - Wait until ADC reports RP_TRIG_STATE_TRIGGERED.
+        Both generators run continuously — no firing needed here.
+        For scan mode: ADC triggers on the next positive edge of the
+        free-running Out1 square wave (RP_TRIG_SRC_AWG_PE).
+        For lock/monitor modes: ADC triggers on the next positive edge
+        of In2 (RP_TRIG_SRC_CHB_PE), driven by the cavity RP's Out1.
+
+        The ADC is re-armed on every call so it catches the very next edge.
         """
-        if not self.trigger_armed:
-            rp.rp_AcqStop()
-            rp.rp_AcqSetTriggerSrc(rp.RP_TRIG_SRC_AWG_PE)
-            rp.rp_AcqSetTriggerDelay(self.N)
-            rp.rp_AcqStart()
+        rp.rp_AcqStop()
+        rp.rp_AcqSetTriggerSrc(self._trig_src)
+        rp.rp_AcqSetTriggerDelay(self.N)
+        rp.rp_AcqStart()
 
-        if self.mode == "scan":
-            # Fire both generators together so the ramp and trigger are in sync.
-            # Reset state machines first to ensure they start from the beginning.
-            rp.rp_GenResetChannelSM(_CH[0])   # gen_trig (Out1, square wave)
-            rp.rp_GenTriggerOnly(_CH[0])
-            rp.rp_GenResetChannelSM(_CH[1])   # gen_ramp (Out2, ramp)
-            rp.rp_GenTriggerOnly(_CH[1])
-
-        # Wait for ADC trigger — mirrors original `while osc[1].status_run(): pass`
+        # Wait for trigger edge
         while True:
             _ret, state = rp.rp_AcqGetTriggerState()
             if state == rp.RP_TRIG_STATE_TRIGGERED:
@@ -798,13 +842,6 @@ class RP:
         rp.rp_AcqGetDataVNP(rp.RP_CH_1, trig_pos, ch1)
         rp.rp_AcqGetDataVNP(rp.RP_CH_2, trig_pos, ch2)
 
-        # Re-arm for next cycle (mirrors original osc[1].reset() + osc[1].start())
-        rp.rp_AcqStop()
-        rp.rp_AcqSetTriggerSrc(rp.RP_TRIG_SRC_AWG_PE)
-        rp.rp_AcqSetTriggerDelay(self.N)
-        rp.rp_AcqStart()
-        self.trigger_armed = True
-
         self.acquisition = np.array([self.times, ch1, ch2])
         return self.acquisition
 
@@ -818,14 +855,6 @@ class RP:
 
         arr = np.zeros(self.N, dtype=np.float32)
         rp.rp_AcqGetDataVNP(_ACQ_CH[ch], trig_pos, arr)
-
-        # Re-arm for next cycle
-        rp.rp_AcqStop()
-        rp.rp_AcqSetTriggerSrc(rp.RP_TRIG_SRC_AWG_PE)
-        rp.rp_AcqSetTriggerDelay(self.N)
-        rp.rp_AcqStart()
-        self.trigger_armed = True
-
         return arr
 
     def close(self):

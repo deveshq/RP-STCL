@@ -244,7 +244,7 @@ class RP_connection:
         # iterate through each file and update it on the RedPitaya
         for key in ["Lock", "Lib", "Run", "Peaks"]:
             path = PurePosixPath(
-                "/root", filenames[key]
+                "/home/jupyter/RedPitaya", filenames[key]
             )  # path on RP
             localpath = filepaths[key]  # path on PC
             if (
@@ -288,7 +288,7 @@ class RP_connection:
             self.addr[0], port=22, username="root", password="root", timeout=5
         )  # the standard port 22 is hardcoded here.
         ssh.exec_command(
-            "PYTHONPATH=/opt/redpitaya/lib/python/:$PYTHONPATH python3 /root/RunLock.py"
+            "python3 /home/jupyter/RedPitaya/RunLock.py"
         )  # run the script which initiates socket server!
         ssh.close()  # close the ssh connection afterwards, otherwise there are problems with multiprocessing...
         self.connected = True
