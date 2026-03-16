@@ -247,21 +247,37 @@ class RP_connection:
                 "/home/jupyter/RedPitaya", filenames[key]
             )  # path on RP
             localpath = filepaths[key]  # path on PC
-            if (
-                key == "Run"
-            ):  # This is the one file on the redpitaya requiring the hostname!
-                # read the file
-                with localpath.open("r", encoding="utf-8") as f:
-                    lines = f.readlines()
-                # update certain lines of the script with the necessary information.
-                lines[4] = f"host, port = '{hostname}', 5000\n"
-                lines[
-                    5
-                ] = f"Lock = RP_Server(host, port, 5065, RP_mode = '{self.mode}')\n"
-                # now, overwrite the file!
-                with localpath.open("w", encoding="utf-8") as f:
-                    f.writelines(lines)
-            sftp.put(str(localpath), str(path))  # send updated script to the redpitaya.
+            if key == "Run":
+                # Build RunLock.py content in memory, injecting hostname and mode.
+                # This avoids mutating the source file on disk and removes the
+                # fragile hardcoded line-number dependency.
+                runlock_lines = [
+                    "# -*- coding: utf-8 -*-\n",
+                    "\n",
+                    "import sys\n",
+                    "if sys.version_info < (3, 5):\n",
+                    "    raise RuntimeError(\n",
+                    "        \"Python 3.5 or newer is required."
+                    " Running: {}.{}.{}\".format(\n",
+                    "            sys.version_info.major,\n",
+                    "            sys.version_info.minor,\n",
+                    "            sys.version_info.micro,\n",
+                    "        )\n",
+                    "    )\n",
+                    "\n",
+                    "from RP_Lock import *\n",
+                    "\n",
+                    "host, port = '{hostname}', 5000\n".format(hostname=hostname),
+                    "Lock = RP_Server(host, port, 5065,"
+                    " RP_mode = '{mode}')\n".format(mode=self.mode),
+                    "Lock.setup_server(loop=False)\n",
+                    "Lock.start_server()\n",
+                ]
+                content = "".join(runlock_lines)
+                with sftp.open(str(path), "w") as remote_f:
+                    remote_f.write(content)
+            else:
+                sftp.put(str(localpath), str(path))  # send script to the redpitaya.
         # close the connection again.
         sftp.close()
         ssh.close()

@@ -56,8 +56,10 @@ class Receiver:
         self.sel = selectors.DefaultSelector()  # reinitialize the selector!
         # setup the socket to listen to external commands!
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # IPv4 TCP socket
-        # Avoid bind() exception: OSError: [Errno 48] Address already in use
+        # Avoid bind() exception after unclean exit: SO_REUSEADDR releases TIME_WAIT
+        # ports, SO_REUSEPORT allows immediate rebind even if a zombie holds the port.
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         self.sock.bind(self.addr)
         self.sock.listen()
         print("Listening on {}".format(self.addr))
@@ -81,7 +83,7 @@ class Receiver:
                 # print('hi')
                 sleep(1e-4)
                 # if defined, run the iteration!
-                if self.iteration != None:
+                if self.iteration is not None:
                     self.iteration()
                 if self.loop:
                     events = self.sel.select(
@@ -90,7 +92,7 @@ class Receiver:
                 else:
                     events = self.sel.select(timeout=None)
                 for key, mask in events:
-                    if (not self.loop) and (key.data == None):
+                    if (not self.loop) and (key.data is None):
                         self.accept_wrapper(key.fileobj)
                     else:
                         message = key.data
@@ -136,7 +138,7 @@ class reaction_loop(Receiver):  #### USE THIS FOR THE LOCKING LOOP
         self.setup_server(loop=True)
         print("server connection established! Calling loop setup!")
         # call the setup prior to starting the event loop, if defined
-        if self.setup != None:
+        if self.setup is not None:
             self.setup()
         print("finished setup, starting server!")
         # start the event loop!
@@ -186,12 +188,12 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
 
     def action_test(self, query):  # has been used for testing timings
         times = []
-        range = [0, 8000]
+        r = [0, 8000]
         for i in range(1000):
             dat = self.lock.acquire_ch(0)
             t0 = perf_counter()
             # np.argmax(dat[:8000])
-            x, y = dat[range[0] : range[-1]], dat[range[0] : range[-1]]
+            x, y = dat[r[0] : r[-1]], dat[r[0] : r[-1]]
             t1 = perf_counter() - t0
             times.append(t1)
         return times
@@ -290,7 +292,7 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
         return peaks  # return the list of peaks!
 
     def action_acquire_errs(self, query):
-        if self.lock.FSR_ref == None:
+        if self.lock.FSR_ref is None:
             self.lock.init_FSR_ref()  # first, save the FSR for proper error calculation!
         self.lock.update_pos()
         if self.lock.skipped:
@@ -302,6 +304,7 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
 
     def action_set_peakfinder(self, query):
         # query is a dictionary
+        query = dict(query)  # copy to avoid mutating the caller's dict
         name = query.pop("name")
         self.peak_finder = name
         if name[:2] == "SG":  # if savitzky golay filter is involved
@@ -396,7 +399,7 @@ class PID:
             print("PID reached limit {}!".format(min_lim))
 
     def update(self, e, t):
-        if (self.e_prev == None) & (self.t_prev == None):
+        if (self.e_prev is None) and (self.t_prev is None):
             self.e_prev, self.t_prev = e, t
         else:
             if self.on:
@@ -586,7 +589,7 @@ class RP:  # handles the functionality of the redpitaya
         for ch in range(2):
             del self.osc[ch]
         del self.gen_ramp
-        del self.gen_laser
+        del self.gen_trig
 
 
 class RP_Lock(RP, reaction_loop):
@@ -677,6 +680,7 @@ class RP_Lock(RP, reaction_loop):
         return acquisition
 
     def update_peak_finder(self, laser, values):
+        values = dict(values)  # copy to avoid mutating the caller's dict
         name = values.pop("name")  # remove name from peak_finder settings
         if name[:2] == "SG":  # if savitzky golay filter is involved
             self.settings[laser]["SG_m"] = SG_array(**values)  # calculate conv. matrix
@@ -880,13 +884,13 @@ class RP_Lock(RP, reaction_loop):
         Bools = []
         for key, val in self.settings.items():
             if key == "Master":
-                range = val["range"][1]
-                i0 = self.times[range[0]]
-                i1 = self.times[range[1]]
+                r = val["range"][1]
+                i0 = self.times[r[0]]
+                i1 = self.times[r[1]]
             else:
-                range = val["range"]
-                i0 = self.times[range[0]]
-                i1 = self.times[range[1]]
+                r = val["range"]
+                i0 = self.times[r[0]]
+                i1 = self.times[r[1]]
             v = val["lockpoint"]
             if not (i0 < v < i1):
                 print("Lockpoint {} for {} out of range!".format(v, key))
@@ -914,13 +918,13 @@ class RP_Lock(RP, reaction_loop):
         Bools = []
         for key, val in self.settings.items():
             if key == "Master":
-                range = val["range"][1]
-                i0 = self.times[range[0]] - self.Master_pos
-                i1 = self.times[range[1]] - self.Master_pos
+                r = val["range"][1]
+                i0 = self.times[r[0]] - self.Master_pos
+                i1 = self.times[r[1]] - self.Master_pos
             else:
-                range = val["range"]
-                i0 = self.times[range[0]] - self.Master_pos
-                i1 = self.times[range[1]] - self.Master_pos
+                r = val["range"]
+                i0 = self.times[r[0]] - self.Master_pos
+                i1 = self.times[r[1]] - self.Master_pos
             pos = val["position"]
 
             if (abs(pos - i0) <= dmin) or (abs(pos - i1) <= dmin):
